@@ -8,3 +8,4 @@ accelerate
 datasets
 tensorboard
 peft
+matplotlib

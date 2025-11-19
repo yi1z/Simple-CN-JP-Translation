@@ -282,6 +282,14 @@ class DistillationTrainer:
             self.student_model = self.student_model.half()
         else:
             self.scaler = None
+
+        # Track loss history for visualization
+        self.history = {
+            'train_loss': [],
+            'kl_loss': [],
+            'ce_loss': [],
+            'val_loss': []
+        }
         
     def _init_student_from_teacher(self):
         """Initialize student model from teacher (for compatible layers)"""
@@ -633,6 +641,12 @@ class DistillationTrainer:
             # Validate
             val_loss = self.validate()
             print(f"Val Loss: {val_loss:.4f}")
+
+            # Record history for plotting later
+            self.history['train_loss'].append(train_loss)
+            self.history['kl_loss'].append(kl_loss if self.args.use_soft_labels else 0.0)
+            self.history['ce_loss'].append(ce_loss if self.args.use_soft_labels else 0.0)
+            self.history['val_loss'].append(val_loss)
             
             # Save checkpoint
             checkpoint_dir = os.path.join(self.args.output_dir, f"checkpoint-epoch-{epoch+1}")
@@ -670,6 +684,39 @@ class DistillationTrainer:
                     json.dump(config_dict, f, indent=2)
         
         print("\nTraining completed!")
+        self.plot_loss_history()
+
+    def plot_loss_history(self):
+        """Plot KL, CE, and total loss for each epoch."""
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("Matplotlib not available; skipping loss history plot.")
+            return
+        if not self.history['train_loss']:
+            return
+
+        epochs = range(1, len(self.history['train_loss']) + 1)
+        plt.figure(figsize=(8, 5))
+        plt.plot(epochs, self.history['train_loss'], marker='o', label='Total Loss')
+
+        if self.args.use_soft_labels:
+            plt.plot(epochs, self.history['kl_loss'], marker='s', label='KL Loss')
+            plt.plot(epochs, self.history['ce_loss'], marker='^', label='CE Loss')
+
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training Loss History")
+        plt.xticks(list(epochs))
+        plt.grid(True, linestyle='--', alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        plot_path = os.path.join(self.args.output_dir, "loss_history.png")
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"Saved loss history plot to {plot_path}")
 
 
 def main():
