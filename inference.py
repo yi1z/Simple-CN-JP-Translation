@@ -1,5 +1,6 @@
 from modelscope import AutoModelForCausalLM, AutoTokenizer
 import os
+import torch
 
 
 language = input("Enter the language you want to translate to: ")
@@ -10,10 +11,11 @@ if model_name_or_path == "":
     model_name_or_path = "Hunyuan-MT-7B"
     print("Using default model: Hunyuan-MT-7B")
 
-print(f"Loading model from {model_name_or_path}")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Loading model from {model_name_or_path} on {device}")
 
 tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
+model = AutoModelForCausalLM.from_pretrained(model_name_or_path).to(device)
 
 print("Model loaded")
 
@@ -24,7 +26,7 @@ while curr_text != "eos":
     curr_text = input("Enter the text to translate (type 'eos' to end): ")
 
 messages = [
-    {"role": "user", "content": f"Translate the following segment into {language}, use a casual tone, without additional explanation.\n\n{input_text}"},
+    {"role": "user", "content": f"Translate the following segment into {language}, without additional explanation.\n\n{input_text}"},
 ]
 
 print("Tokenizing input")
@@ -37,7 +39,9 @@ tokenized_chat = tokenizer.apply_chat_template(
 
 print("Generating output")
 
-outputs = model.generate(tokenized_chat.to(model.device), max_new_tokens=2048)
+tokenized_chat = tokenized_chat.to(device)
+
+outputs = model.generate(tokenized_chat, max_new_tokens=2048)
 output_text = tokenizer.decode(outputs[0])
 
 print("Output:")
