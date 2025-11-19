@@ -283,12 +283,10 @@ class DistillationTrainer:
         else:
             self.scaler = None
 
-        # Track loss history for visualization
+        # Track loss history for later visualization
         self.history = {
-            'train_loss': [],
-            'kl_loss': [],
-            'ce_loss': [],
-            'val_loss': []
+            'train_iterations': [],
+            'val_epochs': []
         }
         
     def _init_student_from_teacher(self):
@@ -502,16 +500,22 @@ class DistillationTrainer:
                             labels,
                             self.args.temperature
                         )
-                        total_kl_loss += kl_loss.item()
-                        total_ce_loss += ce_loss.item()
+                        kl_value = kl_loss.item()
+                        ce_value = ce_loss.item()
+                        total_kl_loss += kl_value
+                        total_ce_loss += ce_value
                     else:
                         loss = F.cross_entropy(
                             student_logits.view(-1, student_logits.size(-1)),
                             labels.view(-1),
                             ignore_index=-100
                         )
+                        kl_value = None
+                        ce_value = None
                 
                 # Scale loss and backward pass
+                loss_value = loss.item()
+                self._record_iteration(epoch, batch_idx, loss_value, kl_value, ce_value)
                 loss = loss / self.args.gradient_accumulation_steps
                 self.scaler.scale(loss).backward()
             else:
@@ -533,19 +537,25 @@ class DistillationTrainer:
                         labels,
                         self.args.temperature
                     )
-                    total_kl_loss += kl_loss.item()
-                    total_ce_loss += ce_loss.item()
+                    kl_value = kl_loss.item()
+                    ce_value = ce_loss.item()
+                    total_kl_loss += kl_value
+                    total_ce_loss += ce_value
                 else:
                     loss = F.cross_entropy(
                         student_logits.view(-1, student_logits.size(-1)),
                         labels.view(-1),
                         ignore_index=-100
                     )
+                    kl_value = None
+                    ce_value = None
                 
+                loss_value = loss.item()
+                self._record_iteration(epoch, batch_idx, loss_value, kl_value, ce_value)
                 loss = loss / self.args.gradient_accumulation_steps
                 loss.backward()
             
-            total_loss += loss.item() * self.args.gradient_accumulation_steps
+            total_loss += loss_value
             
             # Update weights only after accumulating gradients
             if (batch_idx + 1) % self.args.gradient_accumulation_steps == 0:
@@ -642,11 +652,15 @@ class DistillationTrainer:
             val_loss = self.validate()
             print(f"Val Loss: {val_loss:.4f}")
 
-            # Record history for plotting later
-            self.history['train_loss'].append(train_loss)
-            self.history['kl_loss'].append(kl_loss if self.args.use_soft_labels else 0.0)
-            self.history['ce_loss'].append(ce_loss if self.args.use_soft_labels else 0.0)
-            self.history['val_loss'].append(val_loss)
+            # Record per-epoch summary
+            self.history['val_epochs'].append({
+                'epoch': epoch + 1,
+                'train_loss': train_loss,
+                'kl_loss': kl_loss if self.args.use_soft_labels else None,
+                'ce_loss': ce_loss if self.args.use_soft_labels else None,
+                'val_loss': val_loss
+            })
+            self.save_history()
             
             # Save checkpoint
             checkpoint_dir = os.path.join(self.args.output_dir, f"checkpoint-epoch-{epoch+1}")
@@ -684,39 +698,29 @@ class DistillationTrainer:
                     json.dump(config_dict, f, indent=2)
         
         print("\nTraining completed!")
-        self.plot_loss_history()
+        self.save_history()
 
-    def plot_loss_history(self):
-        """Plot KL, CE, and total loss for each epoch."""
-        try:
-            import matplotlib.pyplot as plt
-        except ImportError:
-            print("Matplotlib not available; skipping loss history plot.")
+    def _record_iteration(self, epoch, batch_idx, loss_value, kl_value, ce_value):
+        """Store per-iteration loss information for later analysis."""
+        self.history['train_iterations'].append({
+            'epoch': epoch + 1,
+            'batch_index': batch_idx + 1,
+            'global_step': len(self.history['train_iterations']) + 1,
+            'loss': float(loss_value),
+            'kl_loss': float(kl_value) if kl_value is not None else None,
+            'ce_loss': float(ce_value) if ce_value is not None else None
+        })
+
+    def save_history(self):
+        """Persist loss history to disk for external visualization."""
+        if not self.history['train_iterations'] and not self.history['val_epochs']:
             return
-        if not self.history['train_loss']:
-            return
-
-        epochs = range(1, len(self.history['train_loss']) + 1)
-        plt.figure(figsize=(8, 5))
-        plt.plot(epochs, self.history['train_loss'], marker='o', label='Total Loss')
-
-        if self.args.use_soft_labels:
-            plt.plot(epochs, self.history['kl_loss'], marker='s', label='KL Loss')
-            plt.plot(epochs, self.history['ce_loss'], marker='^', label='CE Loss')
-
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Training Loss History")
-        plt.xticks(list(epochs))
-        plt.grid(True, linestyle='--', alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
 
         os.makedirs(self.args.output_dir, exist_ok=True)
-        plot_path = os.path.join(self.args.output_dir, "loss_history.png")
-        plt.savefig(plot_path)
-        plt.close()
-        print(f"Saved loss history plot to {plot_path}")
+        history_path = os.path.join(self.args.output_dir, "loss_history.json")
+        with open(history_path, 'w', encoding='utf-8') as f:
+            json.dump(self.history, f, indent=2)
+        print(f"Saved loss history to {history_path}")
 
 
 def main():
