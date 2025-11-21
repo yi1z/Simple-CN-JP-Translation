@@ -1,21 +1,18 @@
 from modelscope import AutoModelForCausalLM, AutoTokenizer
 import os
 import torch
+import argparse
 
-
-language = input("Enter the language you want to translate to: ")
-language = language.lower()
-
-model_name_or_path = input("Enter the model name or path: ")
-if model_name_or_path == "":
-    model_name_or_path = "Hunyuan-MT-7B"
-    print("Using default model: Hunyuan-MT-7B")
+parser = argparse.ArgumentParser()
+parser.add_argument("--model_name_or_path", type=str, default="Hunyuan-MT-7B")
+parser.add_argument("--language", type=str, default="Chinese")
+args = parser.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Loading model from {model_name_or_path} on {device}")
+print(f"Loading model from {args.model_name_or_path} on {device}")
 
-tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-model = AutoModelForCausalLM.from_pretrained(model_name_or_path).to(device)
+tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path).to(device)
 
 print("Model loaded")
 
@@ -26,7 +23,7 @@ while curr_text != "eos":
     curr_text = input("Enter the text to translate (type 'eos' to end): ")
 
 messages = [
-    {"role": "user", "content": f"Translate the following segment into {language}, without additional explanation.\n\n{input_text}"},
+    {"role": "user", "content": f"Translate the following segment into {args.language}, without additional explanation.\n\n{input_text}"},
 ]
 
 print("Tokenizing input")
@@ -46,5 +43,5 @@ output_text = tokenizer.decode(outputs[0])
 
 print("Output:")
 # output only the translated text
-output_text = output_text.split("<|extra_0|>")[1].split("<|eos|>")[0]
+# output_text = output_text.split("<|extra_0|>")[1].split("<|eos|>")[0]
 print(output_text)
