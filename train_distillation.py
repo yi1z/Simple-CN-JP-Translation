@@ -715,7 +715,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=5e-4,
                         help="Learning rate (recommended: 3e-4 to 5e-4 for distillation)")
-    parser.add_argument("--num_epochs", type=int, default=4)
+    parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=2.5,
                         help="Temperature for distillation (lower preserves more info, recommended: 2.0-3.0)")
     parser.add_argument("--kl_loss_weight", type=float, default=0.2,
@@ -723,8 +723,8 @@ def main():
     parser.add_argument("--ce_loss_weight", type=float, default=0.8,
                         help="Weight applied to cross-entropy loss component")
     parser.add_argument("--student_hidden_size", type=int, default=2048)
-    parser.add_argument("--student_num_layers", type=int, default=16)
-    parser.add_argument("--student_num_heads", type=int, default=16)
+    parser.add_argument("--student_num_layers", type=int, default=12)
+    parser.add_argument("--student_num_heads", type=int, default=8)
     parser.add_argument("--student_intermediate_size", type=int, default=8192)
     parser.add_argument("--max_iterations_per_epoch", type=int, default=10000,
                         help="Maximum number of iterations per epoch (None = use all data)")
@@ -740,7 +740,7 @@ def main():
                         help="Number of samples to inspect during sanity check")
     parser.add_argument("--sanity_max_new_tokens", type=int, default=128,
                         help="Max new tokens to decode when previewing generations")
-    parser.add_argument("--sanity_seed", type=int, default=100,
+    parser.add_argument("--sanity_seed", type=int, default=10000,
                         help="Random seed for selecting sanity-check samples")
     
     args = parser.parse_args()
