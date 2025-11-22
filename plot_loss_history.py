@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 
+import numpy as np
 
 def load_history(path: str):
     if not os.path.exists(path):
@@ -25,6 +26,12 @@ def plot_history(history, output_path: str, show: bool = False):
 
     steps = [entry["global_step"] for entry in train_iterations]
     total_losses = [entry["loss"] for entry in train_iterations]
+
+    # soften the loss curve
+    softened_losses = []
+    for i in range(0, len(total_losses)):
+        softened_losses.append(np.mean(total_losses[i:i+100]))
+    
     kl_losses = [
         entry["kl_loss"] for entry in train_iterations if entry["kl_loss"] is not None
     ]
@@ -39,12 +46,12 @@ def plot_history(history, output_path: str, show: bool = False):
     ]
 
     plt.figure(figsize=(10, 6))
-    plt.plot(steps, total_losses, label="Total Loss")
+    plt.plot(steps, softened_losses, label="Average Loss per Step")
 
-    if kl_losses:
-        plt.plot(kl_steps, kl_losses, label="KL Loss")
-    if ce_losses:
-        plt.plot(ce_steps, ce_losses, label="CE Loss")
+    # if kl_losses:
+    #     plt.plot(kl_steps, kl_losses, label="KL Loss")
+    # if ce_losses:
+    #     plt.plot(ce_steps, ce_losses, label="CE Loss")
 
     plt.xlabel("Global Step")
     plt.ylabel("Loss")

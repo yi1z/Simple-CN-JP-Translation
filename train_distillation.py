@@ -151,7 +151,7 @@ class DistillationArguments:
     temperature: float = 2.5  # Reduced from 4.0 - lower temperature preserves more information
     kl_loss_weight: float = 0.5  # Weight applied to KL divergence loss
     ce_loss_weight: float = 0.5  # Weight applied to cross-entropy loss
-    use_soft_labels: bool = True
+    use_soft_labels: bool = False
     
     # Student model config (smaller than teacher)
     student_hidden_size: int = 2048
@@ -180,26 +180,28 @@ class DistillationTrainer:
         self.args = args
         self.device = torch.device(args.device)
         
-        print("Loading teacher model...")
-        self.teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_path)
-        self.teacher_model = AutoModelForCausalLM.from_pretrained(
-            args.teacher_model_path,
-            device_map="auto",
-            torch_dtype=torch.bfloat16
-        )
-        self.teacher_model.eval()
+        if args.teacher_model_path != "None":
+            print("Loading teacher model...")
+            self.teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_path)
+            self.teacher_model = AutoModelForCausalLM.from_pretrained(
+                args.teacher_model_path,
+                device_map="auto",
+                torch_dtype=torch.bfloat16
+            )
+            self.teacher_model.eval()
+        else:
+            print("Using only CE loss")
         
         print("Creating student model...")
-        self.student_tokenizer = self.teacher_tokenizer  # Share tokenizer
-        
-        # Load teacher config and modify for student
-        teacher_config = AutoConfig.from_pretrained(args.teacher_model_path)
         
         if args.student_model_path and os.path.exists(args.student_model_path):
             print(f"Loading student model from {args.student_model_path}")
             self.student_model = AutoModelForCausalLM.from_pretrained(
-                args.student_model_path
+                args.student_model_path,
+                device_map="auto",
+                torch_dtype=torch.bfloat16
             )
+            self.student_tokenizer = AutoTokenizer.from_pretrained(args.student_model_path)
         else:
             print("Initializing new student model...")
             # Create smaller student model config
@@ -210,7 +212,8 @@ class DistillationTrainer:
             student_config.num_key_value_heads = args.student_num_heads // 4
             student_config.intermediate_size = args.student_intermediate_size
             student_config.attention_head_dim = args.student_hidden_size // args.student_num_heads
-            
+            self.student_tokenizer = self.teacher_tokenizer  # Share tokenizer
+
             self.student_model = AutoModelForCausalLM.from_config(student_config)
             # Initialize student embeddings from teacher (if compatible)
             self._init_student_from_teacher()
@@ -384,7 +387,7 @@ class DistillationTrainer:
             
             return logits
     
-    def compute_distillation_loss(self, student_logits, teacher_logits, labels, temperature):
+    def compute_distillation_loss(self, student_logits, labels, temperature, teacher_logits=None):
         """Compute knowledge distillation loss with improved masking"""
         # Shift logits for next token prediction
         # Student logits: shape [batch, seq_len, vocab]
@@ -392,7 +395,9 @@ class DistillationTrainer:
         # Labels: shape [batch, seq_len]
         
         shift_student_logits = student_logits[..., :-1, :].contiguous()
-        shift_teacher_logits = teacher_logits[..., :-1, :].contiguous()
+        if teacher_logits is not None:
+            shift_teacher_logits = teacher_logits[..., :-1, :].contiguous()
+            teacher_probs = F.softmax(shift_teacher_logits / temperature, dim=-1)
         shift_labels = labels[..., 1:].contiguous()
         
         # Create mask for valid tokens (ignore padding and -100)
@@ -411,21 +416,23 @@ class DistillationTrainer:
         
         # Compute KL divergence loss (soft labels) - only on valid tokens
         student_log_probs = F.log_softmax(shift_student_logits / temperature, dim=-1)
-        teacher_probs = F.softmax(shift_teacher_logits / temperature, dim=-1)
         
         # Compute KL divergence
-        kl_div = F.kl_div(
-            student_log_probs,
-            teacher_probs,
-            reduction='none',
-            log_target=False
-        )  # [batch, seq_len-1, vocab]
+        if teacher_logits is not None:
+            kl_div = F.kl_div(
+                student_log_probs,
+                teacher_probs,
+                reduction='none',
+                log_target=False
+            )  # [batch, seq_len-1, vocab]
         
-        kl_div = kl_div.sum(dim=-1)  # [batch, seq_len-1]
-        kl_div = kl_div * mask  # Apply mask to only valid tokens
-        
-        # Average over valid tokens (temperature^2 scaling factor from original paper)
-        kl_loss = (temperature ** 2) * kl_div.sum() / num_valid_tokens
+            kl_div = kl_div.sum(dim=-1)  # [batch, seq_len-1]
+            kl_div = kl_div * mask  # Apply mask to only valid tokens
+            
+            # Average over valid tokens (temperature^2 scaling factor from original paper)
+            kl_loss = (temperature ** 2) * kl_div.sum() / num_valid_tokens
+        else:
+            kl_loss = torch.tensor(0.0, device=student_logits.device)
         
         # Compute cross-entropy loss (hard labels) - only on valid tokens
         # Flatten for cross-entropy
@@ -445,7 +452,10 @@ class DistillationTrainer:
         ce_loss = (ce_loss_per_token * flat_mask).sum() / num_valid_tokens
         
         # Combine losses with weighted sum
-        total_loss = self.args.kl_loss_weight * kl_loss + self.args.ce_loss_weight * ce_loss
+        if teacher_logits is not None:
+            total_loss = self.args.kl_loss_weight * kl_loss + self.args.ce_loss_weight * ce_loss
+        else:
+            total_loss = ce_loss
         
         return total_loss, kl_loss, ce_loss
 
@@ -472,175 +482,6 @@ class DistillationTrainer:
         if cleaned.numel() == 0:
             return ""
         return self.student_tokenizer.decode(cleaned, skip_special_tokens=True).strip()
-
-    def _resolve_model_device(self, model):
-        """Best-effort detection of the primary device of a HF model."""
-        model_device = getattr(model, 'device', None)
-        if model_device is not None:
-            return model_device
-        device_map = getattr(model, 'hf_device_map', None)
-        if isinstance(device_map, dict) and device_map:
-            first_device = next(iter(device_map.values()))
-            if isinstance(first_device, str):
-                return torch.device(first_device)
-        return self.device
-
-    def _generate_from_prompt(self, model, prompt_ids, max_new_tokens):
-        """Helper for greedy decoding from a prompt."""
-        pad_id = self.student_tokenizer.pad_token_id
-        eos_id = self.student_tokenizer.eos_token_id
-        if pad_id is None:
-            pad_id = eos_id
-        device = self._resolve_model_device(model)
-        prompt_ids = prompt_ids.to(device, non_blocking=True)
-        attention_mask = torch.ones_like(prompt_ids, device=device)
-        generation = model.generate(
-            input_ids=prompt_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id
-        )
-        new_tokens = generation[:, prompt_ids.size(1):]
-        if new_tokens.numel() == 0:
-            return ""
-        return self.student_tokenizer.decode(new_tokens[0], skip_special_tokens=True).strip()
-
-    @staticmethod
-    def _normalize_text(text):
-        return (text or "").strip()
-
-    def _save_sanity_report(self, results, split):
-        if not results:
-            return
-        os.makedirs(self.args.output_dir, exist_ok=True)
-        sanity_dir = os.path.join(self.args.output_dir, "sanity_checks")
-        os.makedirs(sanity_dir, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        output_path = os.path.join(sanity_dir, f"{split}_sanity_{timestamp}.json")
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"Saved sanity check details to {output_path}")
-
-    def run_sanity_check(self, split=None, num_samples=None, max_new_tokens=None, seed=None):
-        """Run a lightweight end-to-end sanity check on the data and models."""
-        split = (split or self.args.sanity_split or "train").lower()
-        if split not in {"train", "val"}:
-            raise ValueError("split must be 'train' or 'val'")
-
-        dataset = self.train_dataset if split == "train" else self.val_dataset
-        if dataset is None or len(dataset) == 0:
-            print(f"[Sanity] No data available for split '{split}'.")
-            return []
-
-        sample_goal = num_samples if num_samples is not None else self.args.sanity_samples
-        sample_goal = max(1, min(sample_goal, len(dataset)))
-        decode_len = max_new_tokens if max_new_tokens is not None else self.args.sanity_max_new_tokens
-        rng_seed = seed if seed is not None else self.args.sanity_seed
-        rng = np.random.default_rng(rng_seed)
-
-        if sample_goal >= len(dataset):
-            indices = list(range(len(dataset)))
-        else:
-            indices = rng.choice(len(dataset), size=sample_goal, replace=False).tolist()
-        print(f"[Sanity] Inspecting {len(indices)} samples from '{split}' split (seed={rng_seed})")
-
-        student_training = self.student_model.training
-        self.student_model.eval()
-        results = []
-
-        for pos, idx in enumerate(indices, start=1):
-            example = dataset[int(idx)]
-            prompt_len = int(example.get('prompt_len', 0))
-            was_truncated = bool(example.get('was_truncated', False))
-            input_ids = example['input_ids']
-            attention_mask = example['attention_mask']
-            labels = example['labels']
-
-            total_tokens = int(attention_mask.sum().item())
-            target_token_count = int((labels != -100).sum().item())
-            prompt_mask_issues = int((labels[:prompt_len] != -100).sum().item()) if prompt_len > 0 else 0
-            decoded_target = self._decode_label_tokens(labels)
-
-            batch_input = input_ids.unsqueeze(0)
-            batch_attention = attention_mask.unsqueeze(0)
-            batch_labels = labels.unsqueeze(0)
-
-            student_input = batch_input.to(self.device, non_blocking=True)
-            student_attention = batch_attention.to(self.device, non_blocking=True)
-            label_device = batch_labels.to(self.device, non_blocking=True)
-
-            with torch.no_grad():
-                student_logits = self.student_model(
-                    input_ids=student_input,
-                    attention_mask=student_attention,
-                    labels=None
-                ).logits
-                student_ce = float(self._masked_ce_loss(student_logits, label_device).item())
-
-                teacher_logits = self.get_teacher_logits(batch_input, batch_attention)
-                teacher_logits = teacher_logits.to(self.device)
-                teacher_ce = float(self._masked_ce_loss(teacher_logits, label_device).item())
-
-            prompt_ids = input_ids[:prompt_len].unsqueeze(0) if prompt_len > 0 else None
-            if prompt_ids is None or prompt_ids.size(1) == 0:
-                teacher_generation = "<prompt too short>"
-                student_generation = "<prompt too short>"
-            else:
-                try:
-                    teacher_generation = self._generate_from_prompt(
-                        self.teacher_model,
-                        prompt_ids.clone(),
-                        decode_len
-                    )
-                except Exception as err:
-                    teacher_generation = f"<generation failed: {err}>"
-                try:
-                    student_generation = self._generate_from_prompt(
-                        self.student_model,
-                        prompt_ids.clone(),
-                        decode_len
-                    )
-                except Exception as err:
-                    student_generation = f"<generation failed: {err}>"
-
-            result_entry = {
-                "split": split,
-                "dataset_index": int(idx),
-                "prompt_len": prompt_len,
-                "sequence_tokens": total_tokens,
-                "target_token_count": target_token_count,
-                "was_truncated": was_truncated,
-                "prompt_mask_issues": prompt_mask_issues,
-                "source_text": example['source_text'],
-                "reference_text": example['target_text'],
-                "decoded_reference_from_labels": decoded_target,
-                "teacher_ce_loss": teacher_ce,
-                "student_ce_loss": student_ce,
-                "teacher_generation": teacher_generation,
-                "student_generation": student_generation,
-                "teacher_matches_reference": self._normalize_text(teacher_generation) == self._normalize_text(example['target_text'])
-            }
-            results.append(result_entry)
-
-            print(f"\n[Sanity] Example {pos}/{len(indices)} (idx={idx}, split={split})")
-            print(f"  prompt tokens={prompt_len}, target tokens={target_token_count}, truncated={was_truncated}")
-            if prompt_mask_issues:
-                print(f"  WARNING: {prompt_mask_issues} prompt tokens still have labels != -100")
-            print(f"  Source: {example['source_text']}")
-            print(f"  Reference: {example['target_text']}")
-            print(f"  Teacher CE={teacher_ce:.4f} | Student CE={student_ce:.4f}")
-            print(f"  Teacher generation: {teacher_generation}")
-            print(f"  Student generation: {student_generation}")
-
-        self._save_sanity_report(results, split)
-
-        if student_training:
-            self.student_model.train()
-
-        return results
     
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -678,29 +519,23 @@ class DistillationTrainer:
             )
             student_logits = student_outputs.logits
             
-            # Get teacher logits and compute loss
-            if self.args.use_soft_labels:
+            # compute loss
+            if self.args.use_soft_labels and self.teacher_model is not None:
                 teacher_logits = self.get_teacher_logits(input_ids, attention_mask)
                 teacher_logits = teacher_logits.to(self.device, non_blocking=True)
-                
-                loss, kl_loss, ce_loss = self.compute_distillation_loss(
-                    student_logits,
-                    teacher_logits,
-                    labels,
-                    self.args.temperature
-                )
-                kl_value = kl_loss.item()
-                ce_value = ce_loss.item()
-                total_kl_loss += kl_value
-                total_ce_loss += ce_value
             else:
-                loss = F.cross_entropy(
-                    student_logits.view(-1, student_logits.size(-1)),
-                    labels.view(-1),
-                    ignore_index=-100
-                )
-                kl_value = None
-                ce_value = None
+                teacher_logits = None
+                
+            loss, kl_loss, ce_loss = self.compute_distillation_loss(
+                student_logits,
+                labels,
+                self.args.temperature,
+                teacher_logits
+            )
+            kl_value = kl_loss.item()
+            ce_value = ce_loss.item()
+            total_kl_loss += kl_value
+            total_ce_loss += ce_value
             
             loss_value = loss.item()
             self._record_iteration(epoch, batch_idx, loss_value, kl_value, ce_value)
@@ -893,6 +728,8 @@ def main():
     parser.add_argument("--student_intermediate_size", type=int, default=8192)
     parser.add_argument("--max_iterations_per_epoch", type=int, default=10000,
                         help="Maximum number of iterations per epoch (None = use all data)")
+    parser.add_argument("--use_soft_labels", action="store_true",
+                        help="Use soft labels for distillation")
     parser.add_argument("--run_sanity_check", action="store_true",
                         help="Run a small sanity-check pass before training")
     parser.add_argument("--sanity_check_only", action="store_true",

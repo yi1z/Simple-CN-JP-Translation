@@ -22,6 +22,8 @@ while curr_text != "eos":
     input_text += f"\n{curr_text}"
     curr_text = input("Enter the text to translate (type 'eos' to end): ")
 
+print(f"Input text: {input_text}")
+
 messages = [
     {"role": "user", "content": f"Translate the following segment into {args.language}, without additional explanation.\n\n{input_text}"},
 ]
