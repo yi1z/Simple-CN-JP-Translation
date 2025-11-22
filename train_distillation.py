@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,69 +58,71 @@ class ParallelDataset(Dataset):
             return_tensors="pt"
         ).squeeze(0)
         
-        # Find where the assistant response starts (after <|extra_0|> token)
-        # The extra_0 token marks the start of assistant response
-        extra_0_id = self.tokenizer.convert_tokens_to_ids("<|extra_0|>")
-        if extra_0_id is None or extra_0_id == self.tokenizer.unk_token_id:
-            # Fallback: try to find the token ID directly
-            try:
-                extra_0_id = self.tokenizer.encode("<|extra_0|>", add_special_tokens=False)[0]
-            except:
-                # If we can't find it, use a different strategy
-                # Tokenize separately to find the boundary
-                user_only = self.tokenizer.apply_chat_template(
-                    [messages[0]],
-                    tokenize=True,
-                    add_generation_prompt=False,
-                    return_tensors="pt"
-                ).squeeze(0)
-                prompt_len = len(user_only)
-        else:
-            # Find the position of extra_0 token
-            prompt_len = None
-            for i, token_id in enumerate(tokenized):
-                if token_id == extra_0_id:
-                    prompt_len = i + 1  # Start predicting after extra_0
-                    break
+        # # Find where the assistant response starts (after <|extra_0|> token)
+        # # The extra_0 token marks the start of assistant response
+        # extra_0_id = self.tokenizer.convert_tokens_to_ids("<|extra_0|>")
+        # if extra_0_id is None or extra_0_id == self.tokenizer.unk_token_id:
+        #     # Fallback: try to find the token ID directly
+        #     try:
+        #         extra_0_id = self.tokenizer.encode("<|extra_0|>", add_special_tokens=False)[0]
+        #     except:
+        #         # If we can't find it, use a different strategy
+        #         # Tokenize separately to find the boundary
+        #         user_only = self.tokenizer.apply_chat_template(
+        #             [messages[0]],
+        #             tokenize=True,
+        #             add_generation_prompt=False,
+        #             return_tensors="pt"
+        #         ).squeeze(0)
+        #         prompt_len = len(user_only)
+        # else:
+        #     # Find the position of extra_0 token
+        #     prompt_len = None
+        #     for i, token_id in enumerate(tokenized):
+        #         if token_id == extra_0_id:
+        #             prompt_len = i + 1  # Start predicting after extra_0
+        #             break
         
-        # If we couldn't find the boundary, use a conservative estimate
-        if prompt_len is None:
-            # Tokenize user message separately to get accurate length
-            user_only = self.tokenizer.apply_chat_template(
-                [messages[0]],
-                tokenize=True,
-                add_generation_prompt=False,
-                return_tensors="pt"
-            ).squeeze(0)
-            prompt_len = len(user_only)
-        
-        # Create labels: only predict target tokens (assistant response)
-        labels = tokenized.clone()
-        # Remove tokens before the assistant response
-        labels = labels[prompt_len:]
-        # Add padding tokens to the end of the labels
-        labels = torch.cat([labels, torch.full((prompt_len,), self.tokenizer.pad_token_id)])
-
-        # Mask input after the assistant response
-        tokenized[prompt_len:] = self.tokenizer.pad_token_id
+        # Tokenize user message separately to get accurate length
+        user_only = self.tokenizer.apply_chat_template(
+            [messages[0]],
+            tokenize=True,
+            add_generation_prompt=False,
+            return_tensors="pt"
+        ).squeeze(0)
+        prompt_len = len(user_only)
         
         # Truncate if needed
         input_len = len(tokenized)
         if input_len > self.max_length:
             tokenized = tokenized[:self.max_length]
-            labels = labels[:self.max_length]
         
         # Pad to max_length
         if len(tokenized) < self.max_length:
             padding_length = self.max_length - len(tokenized)
-            tokenized = torch.cat([tokenized, torch.full((padding_length,), self.tokenizer.pad_token_id)])
-            labels = torch.cat([labels, torch.full((padding_length,), self.tokenizer.pad_token_id)])
+            padding = torch.full(
+                (padding_length,),
+                self.tokenizer.pad_token_id,
+                dtype=tokenized.dtype
+            )
+            tokenized = torch.cat([tokenized, padding])
+        
+        attention_mask = (tokenized != self.tokenizer.pad_token_id).long()
+        
+        # Create labels: only predict target tokens (assistant response)
+        labels = tokenized.clone()
+        # Remove tokens before the assistant response
+        labels[:prompt_len] = -100
+        labels[labels == self.tokenizer.pad_token_id] = -100
         
         return {
             'input_ids': tokenized,
+            'attention_mask': attention_mask,
             'labels': labels,
             'source_text': ja_text,
-            'target_text': zh_text
+            'target_text': zh_text,
+            'prompt_len': torch.tensor(prompt_len, dtype=torch.long),
+            'was_truncated': input_len > self.max_length
         }
 
 
@@ -146,8 +149,9 @@ class DistillationArguments:
     
     # Distillation hyperparameters
     temperature: float = 2.5  # Reduced from 4.0 - lower temperature preserves more information
-    alpha: float = 0.7  # Weight for distillation loss vs hard label loss
-    use_soft_labels: bool = True
+    kl_loss_weight: float = 0.5  # Weight applied to KL divergence loss
+    ce_loss_weight: float = 0.5  # Weight applied to cross-entropy loss
+    use_soft_labels: bool = False
     
     # Student model config (smaller than teacher)
     student_hidden_size: int = 2048
@@ -159,8 +163,14 @@ class DistillationArguments:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4
     pin_memory: bool = True
-    gradient_accumulation_steps: int = 1
-    use_amp: bool = True  # Automatic Mixed Precision
+
+    # Sanity-check controls
+    run_sanity_check: bool = False
+    sanity_check_only: bool = False
+    sanity_samples: int = 2
+    sanity_split: str = "train"
+    sanity_max_new_tokens: int = 128
+    sanity_seed: int = 42
 
 
 class DistillationTrainer:
@@ -170,26 +180,28 @@ class DistillationTrainer:
         self.args = args
         self.device = torch.device(args.device)
         
-        print("Loading teacher model...")
-        self.teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_path)
-        self.teacher_model = AutoModelForCausalLM.from_pretrained(
-            args.teacher_model_path,
-            device_map="auto",
-            torch_dtype=torch.bfloat16
-        )
-        self.teacher_model.eval()
+        if args.teacher_model_path != "None":
+            print("Loading teacher model...")
+            self.teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_path)
+            self.teacher_model = AutoModelForCausalLM.from_pretrained(
+                args.teacher_model_path,
+                device_map="auto",
+                torch_dtype=torch.bfloat16
+            )
+            self.teacher_model.eval()
+        else:
+            print("Using only CE loss")
         
         print("Creating student model...")
-        self.student_tokenizer = self.teacher_tokenizer  # Share tokenizer
-        
-        # Load teacher config and modify for student
-        teacher_config = AutoConfig.from_pretrained(args.teacher_model_path)
         
         if args.student_model_path and os.path.exists(args.student_model_path):
             print(f"Loading student model from {args.student_model_path}")
             self.student_model = AutoModelForCausalLM.from_pretrained(
-                args.student_model_path
+                args.student_model_path,
+                device_map="auto",
+                torch_dtype=torch.bfloat16
             )
+            self.student_tokenizer = AutoTokenizer.from_pretrained(args.student_model_path)
         else:
             print("Initializing new student model...")
             # Create smaller student model config
@@ -200,10 +212,11 @@ class DistillationTrainer:
             student_config.num_key_value_heads = args.student_num_heads // 4
             student_config.intermediate_size = args.student_intermediate_size
             student_config.attention_head_dim = args.student_hidden_size // args.student_num_heads
-            
+            self.student_tokenizer = self.teacher_tokenizer  # Share tokenizer
+
             self.student_model = AutoModelForCausalLM.from_config(student_config)
             # Initialize student embeddings from teacher (if compatible)
-            # self._init_student_from_teacher()
+            self._init_student_from_teacher()
 
         print(f"Student model created. Parameters: {sum(p.numel() for p in self.student_model.parameters())/1e9:.2f}B")
         
@@ -214,9 +227,6 @@ class DistillationTrainer:
         if hasattr(self.student_model, 'gradient_checkpointing_enable'):
             self.student_model.gradient_checkpointing_enable()
             print("Enabled gradient checkpointing for memory savings")
-        
-        # Note: AMP scaler works better with FP16 than BFloat16
-        # We'll convert to FP16 after initializing AMP scaler if needed
         
         print("Loading datasets...")
         self.train_dataset = ParallelDataset(
@@ -262,27 +272,16 @@ class DistillationTrainer:
         
         # Calculate total steps
         max_iters = args.max_iterations_per_epoch if args.max_iterations_per_epoch else len(self.train_loader)
-        total_steps = (max_iters // args.gradient_accumulation_steps) * args.num_epochs
+        total_steps = max_iters * args.num_epochs
         
         # Use cosine annealing with warmup for better convergence
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=args.warmup_steps,
             num_training_steps=total_steps,
-            num_cycles=0.5  # Cosine half-cycle
+            num_cycles=0.25  # Cosine half-cycle
         )
         
-        # Mixed precision scaler
-        # Note: AMP scaler works best with FP16, not BFloat16
-        self.use_amp = args.use_amp and args.device == "cuda"
-        if self.use_amp:
-            # Use FP16 scaler (not BFloat16)
-            self.scaler = torch.cuda.amp.GradScaler(enabled=True)
-            # Ensure student model is in FP16 for AMP compatibility (BPFloat16 causes issues)
-            self.student_model = self.student_model.half()
-        else:
-            self.scaler = None
-
         # Track loss history for later visualization
         self.history = {
             'train_iterations': [],
@@ -368,15 +367,17 @@ class DistillationTrainer:
             except Exception as e:
                 print(f"Could not initialize model norm: {e}")
     
-    def get_teacher_logits(self, input_ids):
+    def get_teacher_logits(self, input_ids, attention_mask):
         """Get teacher model logits for distillation"""
         with torch.no_grad():
             # Move input to teacher device efficiently
             teacher_input = input_ids.to(self.teacher_model.device, non_blocking=True)
+            teacher_attention_mask = attention_mask.to(self.teacher_model.device, non_blocking=True)
 
             # Teacher is already in bfloat16, no need for autocast
             outputs = self.teacher_model(
                 input_ids=teacher_input,
+                attention_mask=teacher_attention_mask,
                 labels=None,
                 output_hidden_states=False
             )
@@ -386,7 +387,7 @@ class DistillationTrainer:
             
             return logits
     
-    def compute_distillation_loss(self, student_logits, teacher_logits, labels, temperature):
+    def compute_distillation_loss(self, student_logits, labels, temperature, teacher_logits=None):
         """Compute knowledge distillation loss with improved masking"""
         # Shift logits for next token prediction
         # Student logits: shape [batch, seq_len, vocab]
@@ -394,7 +395,9 @@ class DistillationTrainer:
         # Labels: shape [batch, seq_len]
         
         shift_student_logits = student_logits[..., :-1, :].contiguous()
-        shift_teacher_logits = teacher_logits[..., :-1, :].contiguous()
+        if teacher_logits is not None:
+            shift_teacher_logits = teacher_logits[..., :-1, :].contiguous()
+            teacher_probs = F.softmax(shift_teacher_logits / temperature, dim=-1)
         shift_labels = labels[..., 1:].contiguous()
         
         # Create mask for valid tokens (ignore padding and -100)
@@ -413,21 +416,23 @@ class DistillationTrainer:
         
         # Compute KL divergence loss (soft labels) - only on valid tokens
         student_log_probs = F.log_softmax(shift_student_logits / temperature, dim=-1)
-        teacher_probs = F.softmax(shift_teacher_logits / temperature, dim=-1)
         
         # Compute KL divergence
-        kl_div = F.kl_div(
-            student_log_probs,
-            teacher_probs,
-            reduction='none',
-            log_target=False
-        )  # [batch, seq_len-1, vocab]
+        if teacher_logits is not None:
+            kl_div = F.kl_div(
+                student_log_probs,
+                teacher_probs,
+                reduction='none',
+                log_target=False
+            )  # [batch, seq_len-1, vocab]
         
-        kl_div = kl_div.sum(dim=-1)  # [batch, seq_len-1]
-        kl_div = kl_div * mask  # Apply mask to only valid tokens
-        
-        # Average over valid tokens (temperature^2 scaling factor from original paper)
-        kl_loss = (temperature ** 2) * kl_div.sum() / num_valid_tokens
+            kl_div = kl_div.sum(dim=-1)  # [batch, seq_len-1]
+            kl_div = kl_div * mask  # Apply mask to only valid tokens
+            
+            # Average over valid tokens (temperature^2 scaling factor from original paper)
+            kl_loss = (temperature ** 2) * kl_div.sum() / num_valid_tokens
+        else:
+            kl_loss = torch.tensor(0.0, device=student_logits.device)
         
         # Compute cross-entropy loss (hard labels) - only on valid tokens
         # Flatten for cross-entropy
@@ -447,9 +452,36 @@ class DistillationTrainer:
         ce_loss = (ce_loss_per_token * flat_mask).sum() / num_valid_tokens
         
         # Combine losses with weighted sum
-        total_loss = self.args.alpha * kl_loss + (1 - self.args.alpha) * ce_loss
+        if teacher_logits is not None:
+            total_loss = self.args.kl_loss_weight * kl_loss + self.args.ce_loss_weight * ce_loss
+        else:
+            total_loss = ce_loss
         
         return total_loss, kl_loss, ce_loss
+
+    def _masked_ce_loss(self, logits, labels):
+        """Cross-entropy on next-token prediction with label masking."""
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+            reduction='mean'
+        )
+        return loss
+
+    def _decode_label_tokens(self, label_tensor):
+        """Convert masked label tensor back to readable text."""
+        pad_id = self.student_tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.student_tokenizer.eos_token_id
+        cleaned = label_tensor.clone()
+        cleaned[cleaned == -100] = pad_id
+        cleaned = cleaned[cleaned != pad_id]
+        if cleaned.numel() == 0:
+            return ""
+        return self.student_tokenizer.decode(cleaned, skip_special_tokens=True).strip()
     
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -476,121 +508,55 @@ class DistillationTrainer:
             num_batches_processed += 1
             # Move to device with non_blocking for faster transfer
             input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+            attention_mask = batch['attention_mask'].to(self.device, non_blocking=True)
             labels = batch['labels'].to(self.device, non_blocking=True)
             
-            # Use mixed precision for student forward pass
-            if self.use_amp:
-                # Use FP16 autocast (BPFloat16 not fully supported by AMP scaler)
-                with torch.cuda.amp.autocast(dtype=torch.float16):
-                    # Forward pass through student
-                    student_outputs = self.student_model(
-                        input_ids=input_ids,
-                        labels=None
-                    )
-                    student_logits = student_outputs.logits
-                    
-                    # Get teacher logits and compute loss
-                    if self.args.use_soft_labels:
-                        teacher_logits = self.get_teacher_logits(input_ids)
-                        teacher_logits = teacher_logits.to(self.device, non_blocking=True)
-                        
-                        loss, kl_loss, ce_loss = self.compute_distillation_loss(
-                            student_logits,
-                            teacher_logits,
-                            labels,
-                            self.args.temperature
-                        )
-                        kl_value = kl_loss.item()
-                        ce_value = ce_loss.item()
-                        total_kl_loss += kl_value
-                        total_ce_loss += ce_value
-                    else:
-                        loss = F.cross_entropy(
-                            student_logits.view(-1, student_logits.size(-1)),
-                            labels.view(-1),
-                            ignore_index=-100
-                        )
-                        kl_value = None
-                        ce_value = None
-                
-                # Scale loss and backward pass
-                loss_value = loss.item()
-                self._record_iteration(epoch, batch_idx, loss_value, kl_value, ce_value)
-                loss = loss / self.args.gradient_accumulation_steps
-                self.scaler.scale(loss).backward()
+            # Forward pass through student
+            student_outputs = self.student_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=None
+            )
+            student_logits = student_outputs.logits
+            
+            # compute loss
+            if self.args.use_soft_labels and self.teacher_model is not None:
+                teacher_logits = self.get_teacher_logits(input_ids, attention_mask)
+                teacher_logits = teacher_logits.to(self.device, non_blocking=True)
             else:
-                # Forward pass through student
-                student_outputs = self.student_model(
-                    input_ids=input_ids,
-                    labels=None
-                )
-                student_logits = student_outputs.logits
+                teacher_logits = None
                 
-                # Get teacher logits and compute loss
-                if self.args.use_soft_labels:
-                    teacher_logits = self.get_teacher_logits(input_ids)
-                    teacher_logits = teacher_logits.to(self.device, non_blocking=True)
-                    
-                    loss, kl_loss, ce_loss = self.compute_distillation_loss(
-                        student_logits,
-                        teacher_logits,
-                        labels,
-                        self.args.temperature
-                    )
-                    kl_value = kl_loss.item()
-                    ce_value = ce_loss.item()
-                    total_kl_loss += kl_value
-                    total_ce_loss += ce_value
-                else:
-                    loss = F.cross_entropy(
-                        student_logits.view(-1, student_logits.size(-1)),
-                        labels.view(-1),
-                        ignore_index=-100
-                    )
-                    kl_value = None
-                    ce_value = None
-                
-                loss_value = loss.item()
-                self._record_iteration(epoch, batch_idx, loss_value, kl_value, ce_value)
-                loss = loss / self.args.gradient_accumulation_steps
-                loss.backward()
+            loss, kl_loss, ce_loss = self.compute_distillation_loss(
+                student_logits,
+                labels,
+                self.args.temperature,
+                teacher_logits
+            )
+            kl_value = kl_loss.item()
+            ce_value = ce_loss.item()
+            total_kl_loss += kl_value
+            total_ce_loss += ce_value
+            
+            loss_value = loss.item()
+            self._record_iteration(epoch, batch_idx, loss_value, kl_value, ce_value)
+            loss.backward()
             
             total_loss += loss_value
             
-            # Update weights only after accumulating gradients
-            if (batch_idx + 1) % self.args.gradient_accumulation_steps == 0:
-                if self.use_amp:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
-                    self.optimizer.step()
-                
-                self.scheduler.step()
-                self.optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
             
             # Update progress bar
             if batch_idx % 10 == 0:
                 avg_loss_so_far = total_loss / (batch_idx + 1)
                 progress_bar.set_postfix({
-                    'loss': loss.item() * self.args.gradient_accumulation_steps,
-                    'avg_loss': avg_loss_so_far
+                    'kl_loss': kl_value,
+                    'ce_loss': ce_value,
+                    'loss': loss_value,
+                    'avg_loss': avg_loss_so_far,
                 })
-        
-        # Handle any remaining accumulated gradients if we break early
-        if num_batches_processed > 0 and num_batches_processed % self.args.gradient_accumulation_steps != 0:
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
-                self.optimizer.step()
-            self.scheduler.step()
-            self.optimizer.zero_grad()
         
         avg_loss = total_loss / num_batches_processed if num_batches_processed > 0 else 0.0
         avg_kl_loss = total_kl_loss / num_batches_processed if (self.args.use_soft_labels and num_batches_processed > 0) else 0
@@ -606,11 +572,13 @@ class DistillationTrainer:
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Validating"):
                 input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
                 # Compute loss manually to ensure consistency
                 outputs = self.student_model(
                     input_ids=input_ids,
+                    attention_mask=attention_mask,
                     labels=None
                 )
                 student_logits = outputs.logits
@@ -632,6 +600,10 @@ class DistillationTrainer:
     
     def train(self):
         """Main training loop"""
+        if self.args.sanity_check_only:
+            print("Sanity check only flag detected. Skipping training.")
+            return
+
         print("Starting training...")
         
         best_val_loss = float('inf')
@@ -687,7 +659,8 @@ class DistillationTrainer:
                     },
                     'training_args': {
                         'temperature': self.args.temperature,
-                        'alpha': self.args.alpha,
+                        'kl_loss_weight': self.args.kl_loss_weight,
+                        'ce_loss_weight': self.args.ce_loss_weight,
                         'learning_rate': self.args.learning_rate,
                         'batch_size': self.args.batch_size,
                         'num_epochs': self.args.num_epochs
@@ -727,7 +700,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train distilled model")
     parser.add_argument("--teacher_model_path", type=str, default="Hunyuan-MT-7B",
                         help="Path to teacher model")
-    parser.add_argument("--student_model_path", type=str, default="model",
+    parser.add_argument("--student_model_path", type=str, default=None,
                         help="Path to student model (if continuing training)")
     parser.add_argument("--output_dir", type=str, default="./distilled_model",
                         help="Output directory for distilled model")
@@ -739,25 +712,36 @@ def main():
                         default="Web-Crawled-Corpus-for-Japanese-Chinese-NMT/dev data/WCC-JC/valid-ja.txt")
     parser.add_argument("--val_zh_file", type=str,
                         default="Web-Crawled-Corpus-for-Japanese-Chinese-NMT/dev data/WCC-JC/valid-zh.txt")
-    parser.add_argument("--batch_size", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=5e-4,
                         help="Learning rate (recommended: 3e-4 to 5e-4 for distillation)")
-    parser.add_argument("--num_epochs", type=int, default=4)
+    parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=2.5,
                         help="Temperature for distillation (lower preserves more info, recommended: 2.0-3.0)")
-    parser.add_argument("--alpha", type=float, default=0.7)
+    parser.add_argument("--kl_loss_weight", type=float, default=0.2,
+                        help="Weight applied to KL divergence loss component")
+    parser.add_argument("--ce_loss_weight", type=float, default=0.8,
+                        help="Weight applied to cross-entropy loss component")
     parser.add_argument("--student_hidden_size", type=int, default=2048)
-    parser.add_argument("--student_num_layers", type=int, default=16)
-    parser.add_argument("--student_num_heads", type=int, default=16)
+    parser.add_argument("--student_num_layers", type=int, default=12)
+    parser.add_argument("--student_num_heads", type=int, default=8)
     parser.add_argument("--student_intermediate_size", type=int, default=8192)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
-                        help="Number of gradient accumulation steps (increase effective batch size)")
-    parser.add_argument("--use_amp", action="store_true", default=False,
-                        help="Use automatic mixed precision training")
-    parser.add_argument("--no_amp", dest="use_amp", action="store_false",
-                        help="Disable automatic mixed precision training")
     parser.add_argument("--max_iterations_per_epoch", type=int, default=10000,
                         help="Maximum number of iterations per epoch (None = use all data)")
+    parser.add_argument("--use_soft_labels", action="store_true",
+                        help="Use soft labels for distillation")
+    parser.add_argument("--run_sanity_check", action="store_true",
+                        help="Run a small sanity-check pass before training")
+    parser.add_argument("--sanity_check_only", action="store_true",
+                        help="Only run the sanity check and skip training")
+    parser.add_argument("--sanity_split", type=str, default="train", choices=["train", "val"],
+                        help="Dataset split to sample during sanity check")
+    parser.add_argument("--sanity_samples", type=int, default=3,
+                        help="Number of samples to inspect during sanity check")
+    parser.add_argument("--sanity_max_new_tokens", type=int, default=128,
+                        help="Max new tokens to decode when previewing generations")
+    parser.add_argument("--sanity_seed", type=int, default=10000,
+                        help="Random seed for selecting sanity-check samples")
     
     args = parser.parse_args()
 
@@ -776,17 +760,33 @@ def main():
         learning_rate=args.learning_rate,
         num_epochs=args.num_epochs,
         temperature=args.temperature,
-        alpha=args.alpha,
+        kl_loss_weight=args.kl_loss_weight,
+        ce_loss_weight=args.ce_loss_weight,
         student_hidden_size=args.student_hidden_size,
         student_num_layers=args.student_num_layers,
         student_num_heads=args.student_num_heads,
         student_intermediate_size=args.student_intermediate_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        use_amp=args.use_amp,
-        max_iterations_per_epoch=args.max_iterations_per_epoch
+        max_iterations_per_epoch=args.max_iterations_per_epoch,
+        run_sanity_check=args.run_sanity_check,
+        sanity_check_only=args.sanity_check_only,
+        sanity_samples=args.sanity_samples,
+        sanity_split=args.sanity_split,
+        sanity_max_new_tokens=args.sanity_max_new_tokens,
+        sanity_seed=args.sanity_seed
     )
     
     trainer = DistillationTrainer(dist_args)
+    
+    if dist_args.run_sanity_check or dist_args.sanity_check_only:
+        trainer.run_sanity_check(
+            split=dist_args.sanity_split,
+            num_samples=dist_args.sanity_samples,
+            max_new_tokens=dist_args.sanity_max_new_tokens,
+            seed=dist_args.sanity_seed
+        )
+        if dist_args.sanity_check_only:
+            print("Sanity check completed. Exiting because --sanity_check_only was set.")
+            return
     trainer.train()
 
 
