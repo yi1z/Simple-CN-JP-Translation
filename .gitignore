@@ -9,3 +9,7 @@ README_distillation.md
 2.txt
 Proposal.pdf
 quick_start.sh
+*.rar
+distilled_ce_stage/
+distilled_kl_stage/
+distilled_ce_stage_further/

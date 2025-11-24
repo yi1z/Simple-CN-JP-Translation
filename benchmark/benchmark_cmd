@@ -1,0 +1,5 @@
+python test_distillation_v2.py \
+  --model_path "path/distilled_model" \
+  --test_ja_file "path/WCC-JC/test-ja.txt" \
+  --test_zh_file "path/WCC-JC/test-zh.txt"
+  --output_dir "results_xxx"
